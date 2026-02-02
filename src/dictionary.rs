@@ -23,12 +23,16 @@ pub trait Dictionary: Send + Sync {
 /// Simple in-memory dictionary implementation.
 pub struct SimpleDictionary {
     words: Vec<(Vec<char>, bool)>, // (word, is_common)
+    user_dict_path: Option<std::path::PathBuf>,
 }
 
 impl SimpleDictionary {
     /// Create a new empty dictionary.
     pub fn new() -> Self {
-        Self { words: Vec::new() }
+        Self {
+            words: Vec::new(),
+            user_dict_path: None,
+        }
     }
 
     /// Add a word to the dictionary.
@@ -58,12 +62,84 @@ impl SimpleDictionary {
         dict
     }
 
+    /// Add a word to the in-memory dictionary and save it to the user dictionary file.
+    pub fn add_user_word(&mut self, word: &str) -> std::io::Result<()> {
+        // Add to in-memory dictionary
+        let word_chars: Vec<char> = word.chars().collect();
+
+        // Check if word already exists (case-insensitive)
+        if self.contains(&word_chars) {
+            eprintln!("[POLSKI-LS] Word '{}' already in dictionary", word);
+            return Ok(());
+        }
+
+        self.words.push((word_chars, false));
+
+        // Save to user dictionary file if path is set
+        if let Some(path) = &self.user_dict_path {
+            use std::io::Write;
+
+            eprintln!("[POLSKI-LS] Saving word '{}' to {:?}", word, path);
+
+            // Ensure parent directory exists
+            if let Some(parent) = path.parent() {
+                eprintln!("[POLSKI-LS] Creating directory: {:?}", parent);
+                std::fs::create_dir_all(parent)?;
+                eprintln!("[POLSKI-LS] Directory created successfully");
+            }
+
+            // Append word to file
+            eprintln!("[POLSKI-LS] Opening file for append: {:?}", path);
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+
+            writeln!(file, "{}", word)?;
+            eprintln!("[POLSKI-LS] Successfully added '{}' to user dictionary: {:?}", word, path);
+        } else {
+            eprintln!("[POLSKI-LS] ERROR: No user_dict_path set, word '{}' not saved to file", word);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "User dictionary path not configured. Config directory could not be determined."
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Load embedded + user extension files from ~/.config/polski-ls/*.txt
     pub fn with_user_extensions() -> Self {
         let mut dict = Self::embedded();
 
-        if let Some(config_dir) = dirs::config_dir() {
+        // Try to get config directory, fallback to $HOME/.config if not available
+        let config_dir = dirs::config_dir().or_else(|| {
+            eprintln!("[POLSKI-LS] dirs::config_dir() returned None, using fallback");
+            std::env::var("HOME").ok().map(|home| {
+                let path = std::path::PathBuf::from(home).join(".config");
+                eprintln!("[POLSKI-LS] Fallback config dir: {:?}", path);
+                path
+            })
+        });
+
+        if let Some(config_dir) = config_dir {
+            eprintln!("[POLSKI-LS] Config directory: {:?}", config_dir);
             let polski_ls_dir = config_dir.join("polski-ls");
+
+            // Set the user dictionary path
+            dict.user_dict_path = Some(polski_ls_dir.join("slownik.txt"));
+            eprintln!("[POLSKI-LS] User dictionary path: {:?}", dict.user_dict_path);
+
+            // Create the directory immediately to ensure it exists
+            if !polski_ls_dir.exists() {
+                eprintln!("[POLSKI-LS] Creating polski-ls directory: {:?}", polski_ls_dir);
+                if let Err(e) = std::fs::create_dir_all(&polski_ls_dir) {
+                    eprintln!("[POLSKI-LS] ERROR: Failed to create directory: {}", e);
+                } else {
+                    eprintln!("[POLSKI-LS] Successfully created directory");
+                }
+            }
+
             if polski_ls_dir.is_dir() {
                 if let Ok(entries) = std::fs::read_dir(&polski_ls_dir) {
                     for entry in entries.flatten() {
@@ -77,6 +153,8 @@ impl SimpleDictionary {
                     }
                 }
             }
+        } else {
+            eprintln!("[POLSKI-LS] ERROR: Could not determine config directory!");
         }
 
         dict

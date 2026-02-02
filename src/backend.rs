@@ -5,17 +5,19 @@ use tokio::sync::Mutex;
 use tower_lsp_server::jsonrpc::Result as JsonResult;
 use tower_lsp_server::lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
-    CompletionItem, CompletionItemKind, CompletionList, CompletionOptions, CompletionParams,
+    Command, CompletionItem, CompletionItemKind, CompletionList, CompletionOptions, CompletionParams,
     CompletionResponse, CompletionTextEdit, Diagnostic, DiagnosticSeverity,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    InitializeParams, InitializeResult, InitializedParams, MessageType, Position, Range,
-    ServerCapabilities, ServerInfo, TextEdit, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, Uri, WorkspaceEdit,
+    ExecuteCommandOptions, ExecuteCommandParams, InitializeParams, InitializeResult,
+    InitializedParams, MessageType, Position, Range, ServerCapabilities, ServerInfo, TextEdit,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer};
 
 use crate::dictionary::{Dictionary, SimpleDictionary};
 use crate::pos_conv::LineIndex;
+
+const CMD_ADD_TO_DICTIONARY: &str = "polski-ls.addToDictionary";
 
 /// Document state stored for each open file.
 struct DocumentState {
@@ -27,7 +29,7 @@ struct DocumentState {
 pub struct Backend {
     client: Client,
     documents: Mutex<HashMap<Uri, DocumentState>>,
-    dictionary: Arc<dyn Dictionary>,
+    dictionary: Arc<Mutex<SimpleDictionary>>,
 }
 
 impl Backend {
@@ -35,7 +37,7 @@ impl Backend {
         Self {
             client,
             documents: Mutex::new(HashMap::new()),
-            dictionary: Arc::new(SimpleDictionary::with_user_extensions()),
+            dictionary: Arc::new(Mutex::new(SimpleDictionary::with_user_extensions())),
         }
     }
 
@@ -75,18 +77,21 @@ impl Backend {
         // Extract prefix
         let prefix: Vec<char> = source[word_start..cursor_idx].to_vec();
 
-        // Require at least 2 characters
+        let prefix_string: String = prefix.iter().collect();
+
+        // For very short prefixes, just check if we should offer "add to dictionary"
         if prefix.len() < 2 {
             eprintln!("[POLSKI-LS] prefix too short: {} chars", prefix.len());
             return Ok(Vec::new());
         }
 
-        let prefix_string: String = prefix.iter().collect();
         eprintln!("[POLSKI-LS] looking up prefix: '{}'", prefix_string);
 
         // Get fuzzy matches from dictionary
         let max_edit_distance = if prefix.len() <= 3 { 1 } else { 2 };
-        let fuzzy_matches = self.dictionary.fuzzy_match(&prefix, max_edit_distance, 200);
+        let dictionary = self.dictionary.lock().await;
+        let fuzzy_matches = dictionary.fuzzy_match(&prefix, max_edit_distance, 200);
+        drop(dictionary);
 
         // Score and sort matches
         let mut scored: Vec<(String, f32)> = fuzzy_matches
@@ -121,7 +126,7 @@ impl Backend {
                     new_text: word,
                 })),
                 filter_text: Some(prefix_string.clone()),
-                sort_text: Some(format!("{:05}", idx)),
+                sort_text: Some(format!("{:05}", idx + 1)),
                 ..Default::default()
             })
             .collect();
@@ -145,7 +150,8 @@ impl Backend {
                 continue;
             }
 
-            if !self.dictionary.contains(&word_chars) {
+            let dictionary = self.dictionary.lock().await;
+            if !dictionary.contains(&word_chars) {
                 let word: String = word_chars.iter().collect();
                 let start_pos = line_index.index_to_position(source, start_idx);
                 let end_pos = line_index.index_to_position(source, end_idx);
@@ -297,6 +303,10 @@ impl LanguageServer for Backend {
                     },
                 )),
                 code_action_provider: Some(tower_lsp_server::lsp_types::CodeActionProviderCapability::Simple(true)),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec![CMD_ADD_TO_DICTIONARY.to_string()],
+                    work_done_progress_options: Default::default(),
+                }),
                 ..Default::default()
             },
         })
@@ -425,7 +435,8 @@ impl LanguageServer for Backend {
         let word_string: String = word.iter().collect();
 
         // Check if word is unknown
-        if self.dictionary.contains(&word) {
+        let dictionary = self.dictionary.lock().await;
+        if dictionary.contains(&word) {
             return Ok(None);
         }
 
@@ -433,7 +444,7 @@ impl LanguageServer for Backend {
 
         // Get fuzzy matches for suggestions
         let max_edit_distance = if word.len() <= 3 { 1 } else { 2 };
-        let fuzzy_matches = self.dictionary.fuzzy_match(&word, max_edit_distance, 10);
+        let fuzzy_matches = dictionary.fuzzy_match(&word, max_edit_distance, 10);
 
         if fuzzy_matches.is_empty() {
             return Ok(None);
@@ -445,6 +456,23 @@ impl LanguageServer for Backend {
         };
 
         let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+
+        // Add "Add to dictionary" action first
+        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+            title: format!("Add '{}' to dictionary", word_string),
+            kind: Some(CodeActionKind::QUICKFIX),
+            diagnostics: None,
+            edit: None,
+            command: Some(Command {
+                title: format!("Add '{}' to dictionary", word_string),
+                command: CMD_ADD_TO_DICTIONARY.to_string(),
+                arguments: Some(vec![serde_json::json!({
+                    "word": word_string,
+                    "uri": uri.to_string()
+                })]),
+            }),
+            ..Default::default()
+        }));
 
         for m in fuzzy_matches {
             let suggestion_str: String = m.word.iter().collect();
@@ -473,6 +501,51 @@ impl LanguageServer for Backend {
 
         eprintln!("[POLSKI-LS] Returning {} code actions", actions.len());
         Ok(Some(actions))
+    }
+
+    async fn execute_command(&self, params: ExecuteCommandParams) -> JsonResult<Option<serde_json::Value>> {
+        eprintln!("[POLSKI-LS] execute_command: {}", params.command);
+
+        if params.command == CMD_ADD_TO_DICTIONARY {
+            if let Some(arg) = params.arguments.first() {
+                if let (Some(word), Some(uri_str)) = (
+                    arg.get("word").and_then(|v| v.as_str()),
+                    arg.get("uri").and_then(|v| v.as_str()),
+                ) {
+                    eprintln!("[POLSKI-LS] Adding word to dictionary: '{}'", word);
+
+                    // Add word to dictionary
+                    let mut dictionary = self.dictionary.lock().await;
+                    if let Err(e) = dictionary.add_user_word(word) {
+                        eprintln!("[POLSKI-LS] Error adding word to dictionary: {}", e);
+                        self.client
+                            .show_message(MessageType::ERROR, format!("Failed to add word to dictionary: {}", e))
+                            .await;
+                        return Ok(None);
+                    }
+                    drop(dictionary);
+
+                    // Show success message
+                    self.client
+                        .show_message(MessageType::INFO, format!("Added '{}' to dictionary", word))
+                        .await;
+
+                    // Refresh diagnostics for the document
+                    if let Ok(uri) = uri_str.parse::<Uri>() {
+                        let documents = self.documents.lock().await;
+                        if let Some(doc_state) = documents.get(&uri) {
+                            let source = doc_state.source.clone();
+                            let line_index = doc_state.line_index.clone();
+                            drop(documents);
+
+                            self.publish_diagnostics(&uri, &source, &line_index).await;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(None)
     }
 }
 

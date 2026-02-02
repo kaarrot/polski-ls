@@ -8,3 +8,4 @@ tower-lsp-server = "0.22.1"
 tokio = { version = "1.48", features = ["io-std", "macros", "rt-multi-thread", "sync"] }
 clap = { version = "4.5", features = ["derive"] }
 dirs = "6"
+serde_json = "1.0"
